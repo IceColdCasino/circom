@@ -92,8 +92,9 @@ pub fn multi_inv(values: &Vec<BigInt>, field: &BigInt) -> Vec<BigInt>{
 
 //Bit operations
 pub fn complement(elem: &BigInt, field: &BigInt) -> BigInt {
-    let (sign, mut bit_repr) = bit_representation(elem);
-    let new_sign = if elem == &BigInt::from(0) { Sign::Plus } else { sign};
+    let elem = modulus(elem, field);
+    let (sign, mut bit_repr) = bit_representation(&elem);
+    let new_sign = if elem == BigInt::from(0) { Sign::Plus } else { sign};
     let nbits = field.bits();
     while bit_repr.len() > nbits {
         bit_repr.pop();

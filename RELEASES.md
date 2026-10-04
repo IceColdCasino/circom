@@ -1,5 +1,16 @@
 # Release notes
 
+## October 4, 2026 circom 2.2.4
+
+#### Improvements
+- `--O2` linear simplification no longer joins clusters through private inputs or public signals. Chains that only meet at those signals are simplified in parallel, and a second pass simplifies the residuals together. Large shuffle circuits finish instead of running Gaussian elimination on one cluster.
+
+#### Notes
+- The R1CS can differ from circom 2.2.2 and 2.2.3 `--O2` output. Constraint and wire counts stay the same, and public inputs and outputs are still kept, but different private signals are removed, so the polynomials differ. Proving keys built with an older compiler do not verify proofs from this release. Generate the R1CS and the proving key again.
+
+#### Fixed bugs
+- Bitwise complement now reduces its operand modulo the field before flipping bits, so complementing twice returns the field element. Values already in range are unchanged.
+
 ## October 24, 2025 circom 2.2.3
 #### Extensions
 - Allow extern C++ functions to be used for custom templates in the produced C++ witness generation code. More information [here](https://github.com/iden3/circom/blob/master/mkdocs/docs/circom-language/templates-and-components.md#extern-c-code-in-custom-templates).

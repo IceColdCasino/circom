@@ -1484,6 +1484,7 @@ mod test {
         let expected_y_c = BigInt::from(3);
         let expected_constant_c = BigInt::from(7);
         C::apply_substitution(&mut constraint, &substitution, &field);
+        C::remove_zero_value_coefficients(&mut constraint);
         let y_c = constraint.c.get(&y).unwrap();
         let constant_c = constraint.c.get(&constant).unwrap();
         assert!(constraint.a.is_empty());

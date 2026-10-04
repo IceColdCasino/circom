@@ -42,7 +42,28 @@ impl Cluster {
     }
 }
 
+fn is_bridge_signal(
+    signal: usize,
+    forbidden: &HashSet<usize>,
+    private_lo: usize,
+    private_hi: usize,
+) -> bool {
+    (private_lo <= signal && signal <= private_hi) || forbidden.contains(&signal)
+}
+
 fn build_clusters(linear: LinkedList<C>, no_vars: usize) -> Vec<Cluster> {
+    build_clusters_cutting(linear, no_vars, &HashSet::new(), 1, 0)
+}
+
+// Signals in `forbidden` and private inputs `[private_lo, private_hi]` are not
+// union keys. Chains that only meet at those signals stay separate clusters.
+fn build_clusters_cutting(
+    linear: LinkedList<C>,
+    no_vars: usize,
+    forbidden: &HashSet<usize>,
+    private_lo: usize,
+    private_hi: usize,
+) -> Vec<Cluster> {
     type ClusterArena = Vec<Option<Cluster>>;
     type ClusterPath = Vec<usize>;
     fn shrink_jumps_and_find(c_to_c: &mut ClusterPath, org: usize) -> usize {
@@ -79,6 +100,9 @@ fn build_clusters(linear: LinkedList<C>, no_vars: usize) -> Vec<Cluster> {
             ClusterArena::push(&mut arena, Some(Cluster::new(constraint, signals.len())));
             Vec::push(&mut cluster_to_current, dest);
             for signal in signals {
+                if is_bridge_signal(signal, forbidden, private_lo, private_hi) {
+                    continue;
+                }
                 let prev = signal_to_cluster[signal];
                 signal_to_cluster[signal] = dest;
                 if prev < no_linear {
@@ -272,6 +296,141 @@ fn constant_eq_simplification(
     (subs, cons)
 }
 
+fn forbid_private_inputs(
+    forbidden: &HashSet<usize>,
+    linear: &LinkedList<C>,
+    private_lo: usize,
+    private_hi: usize,
+) -> HashSet<usize> {
+    let mut extended = forbidden.clone();
+    if private_lo > private_hi {
+        return extended;
+    }
+    for constraint in linear {
+        for signal in C::take_cloned_signals(constraint) {
+            if private_lo <= signal && signal <= private_hi {
+                extended.insert(signal);
+            }
+        }
+    }
+    extended
+}
+
+fn compose_substitutions(earlier: &mut LinkedList<S>, later: &LinkedList<S>, field: &BigInt) {
+    use circom_algebra::simplification_utils::build_encoded_fast_substitutions;
+    use circom_algebra::simplification_utils::fast_encoded_substitution_substitution;
+    if earlier.is_empty() || later.is_empty() {
+        return;
+    }
+    let mut copy = LinkedList::new();
+    for substitution in later {
+        copy.push_back(substitution.clone());
+    }
+    let encoded = build_encoded_fast_substitutions(copy);
+    for substitution in earlier.iter_mut() {
+        fast_encoded_substitution_substitution(substitution, &encoded, field);
+    }
+}
+
+fn simplify_clusters(
+    clusters: Vec<Cluster>,
+    forbidden: Arc<HashSet<usize>>,
+    field: &BigInt,
+    use_old_heuristics: bool,
+) -> (LinkedList<S>, LinkedList<C>) {
+    use circom_algebra::simplification_utils::full_simplification;
+    use circom_algebra::simplification_utils::Config;
+    use circom_algebra::simplification_utils::Simplified;
+    use std::sync::mpsc;
+    use threadpool::ThreadPool;
+
+    fn run_cluster(
+        cluster: Cluster,
+        forbidden: Arc<HashSet<usize>>,
+        field: &BigInt,
+        use_old_heuristics: bool,
+    ) -> Simplified {
+        full_simplification(Config {
+            field: field.clone(),
+            constraints: cluster.constraints,
+            forbidden,
+            num_signals: cluster.num_signals,
+            use_old_heuristics,
+        })
+    }
+
+    let mut small = Vec::new();
+    let mut large = Vec::new();
+    for cluster in clusters {
+        if Cluster::size(&cluster) <= 1 {
+            small.push(cluster);
+        } else {
+            large.push(cluster);
+        }
+    }
+
+    let (tx, rx) = mpsc::channel();
+    let mut jobs = 0;
+    let mut pool = None;
+    let mut batch = Vec::new();
+    for cluster in small {
+        batch.push(cluster);
+        if batch.len() == 1024 {
+            jobs += 1;
+            let tx = tx.clone();
+            let forbidden = Arc::clone(&forbidden);
+            let field = field.clone();
+            let pool = pool.get_or_insert_with(|| ThreadPool::new(num_cpus::get()));
+            let batch = std::mem::take(&mut batch);
+            ThreadPool::execute(pool, move || {
+                let mut out = Vec::with_capacity(batch.len());
+                for cluster in batch {
+                    out.push(run_cluster(cluster, Arc::clone(&forbidden), &field, use_old_heuristics));
+                }
+                tx.send(out).unwrap();
+            });
+        }
+    }
+    if !batch.is_empty() {
+        jobs += 1;
+        let tx = tx.clone();
+        let forbidden = Arc::clone(&forbidden);
+        let field = field.clone();
+        let pool = pool.get_or_insert_with(|| ThreadPool::new(num_cpus::get()));
+        ThreadPool::execute(pool, move || {
+            let mut out = Vec::with_capacity(batch.len());
+            for cluster in batch {
+                out.push(run_cluster(cluster, Arc::clone(&forbidden), &field, use_old_heuristics));
+            }
+            tx.send(out).unwrap();
+        });
+    }
+    for cluster in large {
+        jobs += 1;
+        let tx = tx.clone();
+        let forbidden = Arc::clone(&forbidden);
+        let field = field.clone();
+        let pool = pool.get_or_insert_with(|| ThreadPool::new(num_cpus::get()));
+        ThreadPool::execute(pool, move || {
+            tx.send(vec![run_cluster(cluster, forbidden, &field, use_old_heuristics)]).unwrap();
+        });
+    }
+    drop(tx);
+    if let Some(pool) = pool {
+        ThreadPool::join(&pool);
+    }
+
+    let mut cons = LinkedList::new();
+    let mut substitutions = LinkedList::new();
+    for _ in 0..jobs {
+        for mut result in rx.recv().unwrap() {
+            LinkedList::append(&mut cons, &mut result.constraints);
+            LinkedList::append(&mut substitutions, &mut result.substitutions);
+        }
+    }
+    (substitutions, cons)
+}
+
 fn linear_simplification(
     log: &mut Option<SubstitutionJSON>,
     linear: LinkedList<C>,
@@ -279,48 +438,35 @@ fn linear_simplification(
     no_labels: usize,
     field: &BigInt,
     use_old_heuristics: bool,
+    private_lo: usize,
+    private_hi: usize,
 ) -> (LinkedList<S>, LinkedList<C>) {
-    use circom_algebra::simplification_utils::full_simplification;
-    use circom_algebra::simplification_utils::Config;
-    use std::sync::mpsc;
-    use threadpool::ThreadPool;
-
-    // println!("Cluster simplification");
-    let mut cons = LinkedList::new();
-    let mut substitutions = LinkedList::new();
-    let clusters = build_clusters(linear, no_labels);
-    let (cluster_tx, simplified_rx) = mpsc::channel();
-    let pool = ThreadPool::new(num_cpus::get());
-    let no_clusters = Vec::len(&clusters);
-    // println!("Clusters: {}", no_clusters);
-    let mut id = 0;
-    for cluster in clusters {
-        let cluster_tx = cluster_tx.clone();
-        let config = Config {
-            field: field.clone(),
-            constraints: cluster.constraints,
-            forbidden: Arc::clone(&forbidden),
-            num_signals: cluster.num_signals,
-            use_old_heuristics,
-        };
-        let job = move || {
-            // println!("cluster: {}", id);
-            let result = full_simplification(config);
-            // println!("End of cluster: {}", id);
-            cluster_tx.send(result).unwrap();
-        };
-        ThreadPool::execute(&pool, job);
-        let _ = id;
-        id += 1;
+    // Chains that only share private inputs or public signals are independent.
+    // Simplify them in parallel, then simplify the residuals together so those
+    // inputs can still be removed.
+    let phase1_forbidden = Arc::new(forbid_private_inputs(&forbidden, &linear, private_lo, private_hi));
+    let clusters = build_clusters_cutting(linear, no_labels, &forbidden, private_lo, private_hi);
+    let (mut substitutions, residuals) =
+        simplify_clusters(clusters, Arc::clone(&phase1_forbidden), field, use_old_heuristics);
+    let mut residuals_kept = LinkedList::new();
+    for constraint in residuals {
+        if !C::is_empty(&constraint) {
+            residuals_kept.push_back(constraint);
+        }
     }
-    ThreadPool::join(&pool);
-
-    for _ in 0..no_clusters {
-        let mut result = simplified_rx.recv().unwrap();
-        log_substitutions(&result.substitutions, log);
-        LinkedList::append(&mut cons, &mut result.constraints);
-        LinkedList::append(&mut substitutions, &mut result.substitutions);
+    let residual_clusters = build_clusters(residuals_kept, no_labels);
+    let (mut residual_substitutions, mut cons) =
+        simplify_clusters(residual_clusters, forbidden, field, use_old_heuristics);
+    compose_substitutions(&mut substitutions, &residual_substitutions, field);
+    LinkedList::append(&mut substitutions, &mut residual_substitutions);
+    let mut kept = LinkedList::new();
+    for constraint in cons {
+        if !C::is_empty(&constraint) {
+            kept.push_back(constraint);
+        }
     }
+    cons = kept;
+    log_substitutions(&substitutions, log);
     (substitutions, cons)
 }
 
@@ -464,6 +610,8 @@ pub fn simplification(smp: &mut Simplifier) -> (ConstraintStorage, SignalMap, us
     let mut lconst = LinkedList::new();
     let mut no_rounds = smp.no_rounds;
     let remove_unused = true;
+    let private_lo = smp.no_public_outputs + smp.no_public_inputs + 1;
+    let private_hi = smp.no_public_outputs + smp.no_public_inputs + smp.no_private_inputs;
 
     let relevant_signals = {
         // println!("Creating first relevant set");
@@ -550,6 +698,8 @@ pub fn simplification(smp: &mut Simplifier) -> (ConstraintStorage, SignalMap, us
             no_labels,
             &field,
             use_old_heuristics,
+            private_lo,
+            private_hi,
         );
         // println!("Building substitution map");
         let now0 = SystemTime::now();
@@ -620,6 +770,8 @@ pub fn simplification(smp: &mut Simplifier) -> (ConstraintStorage, SignalMap, us
             no_labels,
             &field,
             use_old_heuristics,
+            private_lo,
+            private_hi,
         );
 
         for sub in &substitutions {
@@ -727,6 +879,382 @@ pub fn simplification(smp: &mut Simplifier) -> (ConstraintStorage, SignalMap, us
     }
     // println!("NO CONSTANTS: {}", constraint_storage.no_constants());
     (constraint_storage, signal_map, smp.no_private_inputs - deleted_inputs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_clusters, build_clusters_cutting, linear_simplification, simplify_clusters, A, C, S,
+    };
+    use circom_algebra::modular_arithmetic;
+    use circom_algebra::num_bigint::BigInt;
+    use circom_algebra::num_traits::Zero;
+    use std::collections::{BTreeSet, HashMap, HashSet, LinkedList};
+    use std::sync::Arc;
+
+    fn linear_constraint(terms: &[(usize, i64)], field: &BigInt) -> C {
+        let mut coefficients = HashMap::new();
+        coefficients.insert(0usize, BigInt::from(0));
+        for &(signal, coef) in terms {
+            coefficients.insert(signal, BigInt::from(coef));
+        }
+        let mut constraint =
+            A::transform_expression_to_constraint_form(A::Linear { coefficients }, field).unwrap();
+        C::remove_zero_value_coefficients(&mut constraint);
+        constraint
+    }
+
+    fn push(constraints: &mut LinkedList<C>, terms: &[(usize, i64)], field: &BigInt) {
+        constraints.push_back(linear_constraint(terms, field));
+    }
+
+    /// Row/column prefix sums and bit packing, all glued together by a private
+    /// permutation matrix. Mirrors the 8-deck linear system at a smaller n.
+    fn permutation_system(n: usize, field: &BigInt) -> (LinkedList<C>, usize, usize, usize) {
+        let private_lo = 1usize;
+        let private_hi = n * n;
+        let mut next = private_hi + 1;
+        let mut constraints = LinkedList::new();
+        let p = |i: usize, j: usize| private_lo + i * n + j;
+
+        for i in 0..n {
+            let mut prev = None;
+            for j in 0..n {
+                let acc = next;
+                next += 1;
+                let bit = p(i, j);
+                if let Some(prev) = prev {
+                    push(&mut constraints, &[(acc, 1), (prev, -1), (bit, -1)], field);
+                } else {
+                    push(&mut constraints, &[(acc, 1), (bit, -1)], field);
+                }
+                prev = Some(acc);
+            }
+            push(&mut constraints, &[(prev.unwrap(), 1), (0, -1)], field);
+        }
+        for j in 0..n {
+            let mut prev = None;
+            for i in 0..n {
+                let acc = next;
+                next += 1;
+                let bit = p(i, j);
+                if let Some(prev) = prev {
+                    push(&mut constraints, &[(acc, 1), (prev, -1), (bit, -1)], field);
+                } else {
+                    push(&mut constraints, &[(acc, 1), (bit, -1)], field);
+                }
+                prev = Some(acc);
+            }
+            push(&mut constraints, &[(prev.unwrap(), 1), (0, -1)], field);
+        }
+        for i in 0..n {
+            let mut prev = None;
+            for j in 0..n {
+                let acc = next;
+                next += 1;
+                let bit = p(i, j);
+                if let Some(prev) = prev {
+                    push(&mut constraints, &[(acc, 1), (prev, -2), (bit, -1)], field);
+                } else {
+                    push(&mut constraints, &[(acc, 1), (bit, -1)], field);
+                }
+                prev = Some(acc);
+            }
+        }
+        for i in 0..n {
+            for j in 0..n {
+                let diff = next;
+                next += 1;
+                push(&mut constraints, &[(diff, 1), (p(i, j), -1), (0, 1)], field);
+            }
+        }
+        (constraints, next, private_lo, private_hi)
+    }
+
+    fn constraint_row(constraint: &C) -> HashMap<usize, BigInt> {
+        constraint.c().clone()
+    }
+
+    fn substitution_row(substitution: &S, field: &BigInt) -> HashMap<usize, BigInt> {
+        constraint_row(&S::substitution_into_constraint(substitution.clone(), field))
+    }
+
+    fn normalize(value: &BigInt, field: &BigInt) -> BigInt {
+        modular_arithmetic::add(value, &BigInt::from(0), field)
+    }
+
+    fn sub_scaled(
+        row: &mut HashMap<usize, BigInt>,
+        pivot: &HashMap<usize, BigInt>,
+        coef: &BigInt,
+        field: &BigInt,
+    ) {
+        for (signal, value) in pivot {
+            let product = modular_arithmetic::mul(coef, value, field);
+            let current = row.get(signal).cloned().unwrap_or_else(|| BigInt::from(0));
+            let next = modular_arithmetic::sub(&current, &product, field);
+            if next.is_zero() {
+                row.remove(signal);
+            } else {
+                row.insert(*signal, next);
+            }
+        }
+    }
+
+    fn rref(mut rows: Vec<HashMap<usize, BigInt>>, field: &BigInt) -> Vec<(usize, HashMap<usize, BigInt>)> {
+        let mut columns = BTreeSet::new();
+        for row in &rows {
+            for signal in row.keys() {
+                columns.insert(*signal);
+            }
+        }
+        let mut rank_rows = Vec::new();
+        let mut cursor = 0;
+        for column in columns {
+            let mut pivot_at = None;
+            for index in cursor..rows.len() {
+                if rows[index]
+                    .get(&column)
+                    .map(|value| !normalize(value, field).is_zero())
+                    .unwrap_or(false)
+                {
+                    pivot_at = Some(index);
+                    break;
+                }
+            }
+            let Some(pivot_at) = pivot_at else { continue };
+            rows.swap(cursor, pivot_at);
+            let pivot_coef = normalize(&rows[cursor][&column], field);
+            let inv = modular_arithmetic::div(&BigInt::from(1), &pivot_coef, field)
+                .unwrap_or_else(|_| panic!("pivot coefficient has no inverse"));
+            let keys: Vec<usize> = rows[cursor].keys().cloned().collect();
+            for key in keys {
+                let next = modular_arithmetic::mul(&rows[cursor][&key], &inv, field);
+                if next.is_zero() {
+                    rows[cursor].remove(&key);
+                } else {
+                    rows[cursor].insert(key, next);
+                }
+            }
+            let pivot = rows[cursor].clone();
+            for index in 0..rows.len() {
+                if index == cursor {
+                    continue;
+                }
+                if let Some(coef) = rows[index].get(&column).cloned() {
+                    if !normalize(&coef, field).is_zero() {
+                        let mut row = std::mem::take(&mut rows[index]);
+                        sub_scaled(&mut row, &pivot, &coef, field);
+                        rows[index] = row;
+                    }
+                }
+            }
+            rank_rows.push((column, pivot));
+            cursor += 1;
+        }
+        rank_rows
+    }
+
+    fn assert_same_span(
+        original: &LinkedList<C>,
+        reduced: &(LinkedList<S>, LinkedList<C>),
+        field: &BigInt,
+    ) {
+        let original_rows: Vec<_> = original.iter().map(constraint_row).collect();
+        let mut reduced_rows = Vec::new();
+        for substitution in &reduced.0 {
+            reduced_rows.push(substitution_row(substitution, field));
+        }
+        for constraint in &reduced.1 {
+            reduced_rows.push(constraint_row(constraint));
+        }
+        let original_rref = rref(original_rows, field);
+        let reduced_rank = rref(reduced_rows.clone(), field).len();
+        assert_eq!(
+            reduced_rank,
+            original_rref.len(),
+            "reduced system rank {reduced_rank} != original rank {}",
+            original_rref.len()
+        );
+        for mut row in reduced_rows {
+            for (pivot_col, pivot) in &original_rref {
+                if let Some(coef) = row.get(pivot_col).cloned() {
+                    if !normalize(&coef, field).is_zero() {
+                        sub_scaled(&mut row, pivot, &coef, field);
+                    }
+                }
+            }
+            let leftover: Vec<_> = row
+                .iter()
+                .filter(|(_, value)| !normalize(value, field).is_zero())
+                .map(|(signal, value)| (*signal, value.clone()))
+                .collect();
+            assert!(
+                leftover.is_empty(),
+                "reduced equation is not implied by the original system: {:?}",
+                leftover
+            );
+        }
+    }
+
+    #[test]
+    fn private_input_bridges_split_without_changing_the_linear_span() {
+        let n = 4;
+        let field = BigInt::from(101);
+        let (constraints, n_signals, private_lo, private_hi) = permutation_system(n, &field);
+        let mut forbidden = HashSet::new();
+        forbidden.insert(0);
+        let forbidden = Arc::new(forbidden);
+
+        let uncut = build_clusters(constraints.clone(), n_signals);
+        assert_eq!(uncut.len(), 1, "shared private inputs must form one cluster");
+        let cut = build_clusters_cutting(
+            constraints.clone(),
+            n_signals,
+            &forbidden,
+            private_lo,
+            private_hi,
+        );
+        assert!(
+            cut.len() >= 3 * n,
+            "chains should split across private inputs, got {} clusters",
+            cut.len()
+        );
+
+        let monolithic = simplify_clusters(uncut, Arc::clone(&forbidden), &field, false);
+        let split = linear_simplification(
+            &mut None,
+            constraints.clone(),
+            forbidden,
+            n_signals,
+            &field,
+            false,
+            private_lo,
+            private_hi,
+        );
+        assert_same_span(&constraints, &monolithic, &field);
+        assert_same_span(&constraints, &split, &field);
+        assert_nonoverlapping(&split.0);
+    }
+
+    #[test]
+    fn private_input_does_not_merge_independent_chains() {
+        let field = BigInt::from(101);
+        let mut constraints = LinkedList::new();
+        // Signal 1 is a private input. Each chain otherwise uses its own accumulators.
+        push(&mut constraints, &[(2, 1), (1, -1)], &field);
+        push(&mut constraints, &[(3, 1), (2, -1)], &field);
+        push(&mut constraints, &[(4, 1), (1, -1)], &field);
+        push(&mut constraints, &[(5, 1), (4, -1)], &field);
+        let n_signals = 6;
+        let mut forbidden = HashSet::new();
+        forbidden.insert(0);
+        let forbidden = Arc::new(forbidden);
+
+        let uncut = build_clusters(constraints.clone(), n_signals);
+        assert_eq!(uncut.len(), 1);
+        let cut = build_clusters_cutting(constraints.clone(), n_signals, &forbidden, 1, 1);
+        assert_eq!(cut.len(), 2, "the private input must not glue the two chains");
+
+        let split = linear_simplification(
+            &mut None,
+            constraints.clone(),
+            forbidden,
+            n_signals,
+            &field,
+            false,
+            1,
+            1,
+        );
+        assert_same_span(&constraints, &split, &field);
+        assert_nonoverlapping(&split.0);
+    }
+
+    #[test]
+    fn no_private_inputs_preserves_linear_span() {
+        let field = BigInt::from(101);
+        let mut constraints = LinkedList::new();
+        push(&mut constraints, &[(2, 1), (1, -1)], &field);
+        push(&mut constraints, &[(3, 1), (2, -1), (0, -1)], &field);
+        push(&mut constraints, &[(4, 1), (3, -1)], &field);
+        push(&mut constraints, &[(4, 1), (1, -1), (0, -1)], &field);
+        let n_signals = 5;
+        let mut forbidden = HashSet::new();
+        forbidden.insert(0);
+        let forbidden = Arc::new(forbidden);
+
+        let uncut = build_clusters(constraints.clone(), n_signals);
+        assert_eq!(uncut.len(), 1);
+        let monolithic = simplify_clusters(uncut, Arc::clone(&forbidden), &field, false);
+        let split = linear_simplification(
+            &mut None,
+            constraints.clone(),
+            forbidden,
+            n_signals,
+            &field,
+            false,
+            1,
+            0,
+        );
+        assert_same_span(&constraints, &monolithic, &field);
+        assert_same_span(&constraints, &split, &field);
+        assert_nonoverlapping(&split.0);
+    }
+
+    #[test]
+    fn forbidden_public_signal_is_not_eliminated() {
+        let field = BigInt::from(101);
+        let mut constraints = LinkedList::new();
+        // Signal 1 is a public output. Signal 2 is an intermediate.
+        push(&mut constraints, &[(2, 1), (1, -1)], &field);
+        push(&mut constraints, &[(2, 1), (0, -1)], &field);
+        let n_signals = 3;
+        let mut forbidden = HashSet::new();
+        forbidden.insert(0);
+        forbidden.insert(1);
+        let forbidden = Arc::new(forbidden);
+
+        let split = linear_simplification(
+            &mut None,
+            constraints.clone(),
+            Arc::clone(&forbidden),
+            n_signals,
+            &field,
+            false,
+            1,
+            0,
+        );
+        assert_same_span(&constraints, &split, &field);
+        assert_nonoverlapping(&split.0);
+        for substitution in &split.0 {
+            assert!(
+                !forbidden.contains(substitution.from()),
+                "eliminated forbidden signal {}",
+                substitution.from()
+            );
+        }
+    }
+
+    fn assert_nonoverlapping(substitutions: &LinkedList<S>) {
+        let mut eliminated = HashSet::new();
+        for substitution in substitutions {
+            assert!(
+                eliminated.insert(*substitution.from()),
+                "signal {} was eliminated twice",
+                substitution.from()
+            );
+        }
+        for substitution in substitutions {
+            for signal in substitution.to().keys() {
+                assert!(
+                    !eliminated.contains(signal),
+                    "substitution for {} still mentions eliminated signal {}",
+                    substitution.from(),
+                    signal
+                );
+            }
+        }
+    }
 }
 
 
