@@ -621,7 +621,7 @@ pub fn simplification(smp: &mut Simplifier) -> (ConstraintStorage, SignalMap, us
         let s_sub = HashMap::with_capacity(0);
         let c_sub = HashMap::with_capacity(0);
         build_relevant_set(iter, &mut relevant, &s_sub, &c_sub);
-        let _dur = now.elapsed().unwrap().as_millis();
+        let _dur = now.elapsed().unwrap_or_default().as_millis();
         // println!("First relevant set created: {} ms", dur);
         relevant
     };
@@ -653,7 +653,7 @@ pub fn simplification(smp: &mut Simplifier) -> (ConstraintStorage, SignalMap, us
             deleted.insert(signal);
         }
         remove_not_relevant(&mut substitutions, &relevant_signals);
-        let _dur = now.elapsed().unwrap().as_millis();
+        let _dur = now.elapsed().unwrap_or_default().as_millis();
         // println!("End of single assignment simplification: {} ms", dur);
         substitutions
     };
@@ -673,7 +673,7 @@ pub fn simplification(smp: &mut Simplifier) -> (ConstraintStorage, SignalMap, us
         for signal in substitutions.keys().cloned() {
             deleted.insert(signal);
         }
-        let _dur = now.elapsed().unwrap().as_millis();
+        let _dur = now.elapsed().unwrap_or_default().as_millis();
         // println!("End of constant assignment simplification: {} ms", dur);
         substitutions
     };
@@ -684,7 +684,7 @@ pub fn simplification(smp: &mut Simplifier) -> (ConstraintStorage, SignalMap, us
         let mut relevant = HashSet::new();
         let iter = EncodingIterator::new(&smp.dag_encoding);
         build_relevant_set(iter, &mut relevant, &single_substitutions, &cons_substitutions);
-        let _dur = now.elapsed().unwrap().as_millis();
+        let _dur = now.elapsed().unwrap_or_default().as_millis();
         // println!("Relevant built: {} ms", dur);
         relevant
     };
@@ -711,9 +711,9 @@ pub fn simplification(smp: &mut Simplifier) -> (ConstraintStorage, SignalMap, us
             }
         }
         let substitutions = build_encoded_fast_substitutions(only_relevant);
-        let _dur0 = now0.elapsed().unwrap().as_millis();
+        let _dur0 = now0.elapsed().unwrap_or_default().as_millis();
         // println!("End of substitution map: {} ms", dur0);
-        let _dur = now.elapsed().unwrap().as_millis();
+        let _dur = now.elapsed().unwrap_or_default().as_millis();
         // println!("End of cluster simplification: {} ms", dur);
         LinkedList::append(&mut lconst, &mut cons);
         for constraint in &mut lconst {
@@ -738,7 +738,7 @@ pub fn simplification(smp: &mut Simplifier) -> (ConstraintStorage, SignalMap, us
         let mut storage = ConstraintStorage::new();
         let with_linear = obtain_and_simplify_non_linear(iter, &mut storage, &frames, &field);
         crate::state_utils::empty_encoding_constraints(&mut smp.dag_encoding);
-        let _dur = now.elapsed().unwrap().as_millis();
+        let _dur = now.elapsed().unwrap_or_default().as_millis();
         // println!("Storages built in {} ms", dur);
         if no_rounds > 0{
             no_rounds -= 1;
@@ -754,7 +754,7 @@ pub fn simplification(smp: &mut Simplifier) -> (ConstraintStorage, SignalMap, us
         // println!("Building non-linear map");
         let now = SystemTime::now();
         let non_linear_map = build_non_linear_signal_map(&constraint_storage);
-        let _dur = now.elapsed().unwrap().as_millis();
+        let _dur = now.elapsed().unwrap_or_default().as_millis();
         // println!("Non-linear was built in {} ms", dur);
         non_linear_map
     } else {
@@ -793,7 +793,7 @@ pub fn simplification(smp: &mut Simplifier) -> (ConstraintStorage, SignalMap, us
         round_id += 1;
         no_rounds -= 1;
         apply_round = !linear.is_empty() && no_rounds > 0;
-        let _dur = now.elapsed().unwrap().as_millis();
+        let _dur = now.elapsed().unwrap_or_default().as_millis();
         // println!("Iteration no {} took {} ms", round_id, dur);
     }
 
@@ -859,7 +859,7 @@ pub fn simplification(smp: &mut Simplifier) -> (ConstraintStorage, SignalMap, us
             non_linear_map, 
             remove_unused
         );
-        let _dur = now.elapsed().unwrap().as_millis();
+        let _dur = now.elapsed().unwrap_or_default().as_millis();
         // println!("End of rebuild witness: {} ms", dur);
        signal_map
     };

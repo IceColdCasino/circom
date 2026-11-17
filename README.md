@@ -11,7 +11,7 @@
 
 # IceColdCasino fork
 
-Version 2.2.4 changes `--O2` so chains that only share private inputs are simplified in parallel. The linear relation is preserved. The R1CS polynomials can differ from upstream 2.2.3, so existing proving keys must be regenerated. Details are in [RELEASES.md](RELEASES.md).
+Version 2.2.4 changes `--O2` so chains that only share private inputs are simplified in parallel. The linear relation is preserved. The R1CS polynomials can differ from upstream 2.2.3, so existing proving keys must be regenerated. Version 2.2.5 leaves that output alone and ignores a backward step of the system clock while reading those timers. Details are in [RELEASES.md](RELEASES.md).
 
 # About ==>circom
 

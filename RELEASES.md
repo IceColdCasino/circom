@@ -1,5 +1,10 @@
 # Release notes
 
+## November 17, 2026 circom 2.2.5
+
+#### Fixed bugs
+- Timing reads during constraint simplification and the DAG-to-constraint mapping no longer panic when the system clock steps backward. The duration is zero in that case. Those reads only feed commented-out logs, and the generated constraints are unchanged from 2.2.4.
+
 ## October 4, 2026 circom 2.2.4
 
 #### Improvements
